@@ -93,9 +93,9 @@ void writeEepromConfig()
   }
   EEPROM.commit();
 
-  M5.Lcd.fillScreen(BLACK);
-  M5.Lcd.setCursor(0, 0, 2);
-  M5.Lcd.println("REBOOTING");
+  StickCP2.Display.fillScreen(BLACK);
+  StickCP2.Display.setCursor(0, 0, 2);
+  StickCP2.Display.println("REBOOTING");
   delay(2000);
   ESP.restart();
 }
@@ -156,17 +156,17 @@ void displayPing(int pingTargetId)
   // only print ping result if we've actually pinged the host
   if (pingTarget_p->pinged)
   {
-    M5.Lcd.printf("%s: %s\n", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
+    StickCP2.Display.printf("%s: %s\n", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
   }
 }
 
 void displayStatus()
 {
-  M5.Lcd.setCursor(0, 0, 2);
-  M5.Lcd.print(statusMsg);
+  StickCP2.Display.setCursor(0, 0, 2);
+  StickCP2.Display.print(statusMsg);
 
   // display ping status of current ping target
-  M5.Lcd.setCursor(0, 80, 2);
+  StickCP2.Display.setCursor(0, 80, 2);
   if (wifiSetupComplete)
   {
     displayPing(pingTargetNum);
@@ -1001,12 +1001,12 @@ void printEeprom()
 }
 
 void setup() {
-  // initialize M5StickC
-  M5.begin();
-  M5.Lcd.setRotation(1);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.setTextColor(TFT_RED,TFT_BLACK);
-  M5.update();
+  // initialize M5StickCPlus2
+  StickCP2.begin();
+  StickCP2.Display.setRotation(1);
+  StickCP2.Display.setTextSize(2);
+  StickCP2.Display.setTextColor(TFT_RED,TFT_BLACK);
+  StickCP2.update();
 
   sprintf(statusMsg, "starting");
 
@@ -1024,7 +1024,7 @@ void setup() {
   // Initialize EEPROM
   if (!EEPROM.begin(sizeof(EepromConfig))) {  // Request storage of SIZE size(success return)
     Serial.println("\nFailed to initialize EEPROM!");
-    M5.Lcd.println("EEPROM Fail\nFactory Reset needed");
+    StickCP2.Display.println("EEPROM Fail\nFactory Reset needed");
     delay(30000);
     fobSuperSm.skipWifiInit();
     return;
@@ -1042,7 +1042,7 @@ void setup() {
   if (eepromConfig.magic != magicValue)
   {
     Serial.println("\nEEPROM not initialized!");
-    M5.Lcd.println("EEPROM invalid\nFactory Reset needed");
+    StickCP2.Display.println("EEPROM invalid\nFactory Reset needed");
     delay(30000);
     fobSuperSm.skipWifiInit();
     return;
