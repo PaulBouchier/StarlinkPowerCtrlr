@@ -1,4 +1,5 @@
-#include <M5StickCPlus2.h>
+#include <Arduino.h>
+#include <M5Unified.h>
 #include "WiFi.h"
 #include "AsyncUDP.h"
 #include <string>
@@ -7,15 +8,8 @@
 #include <vector>
 
 // global enums
-enum ButtonName {BUTTON_M5, BUTTON_B};
-enum PressType {SHORT_PRESS, LONG_PRESS};
+enum ButtonCommand {SELECT, NEXT, PREVIOUS};
 enum LocalRemoteMode {LOCAL_MODE, REMOTE_MODE};
-
-// button variables
-bool buttonA = false;
-bool buttonALong = false;
-int64_t buttonADownTime;
-bool buttonB = false;
 
 // Display variables
 int displayMode = 0;  // 0: voltage, ping, 1: SSID
@@ -93,9 +87,9 @@ void writeEepromConfig()
   }
   EEPROM.commit();
 
-  StickCP2.Display.fillScreen(BLACK);
-  StickCP2.Display.setCursor(0, 0, 2);
-  StickCP2.Display.println("REBOOTING");
+  M5.Display.fillScreen(BLACK);
+  M5.Display.setCursor(0, 0, 2);
+  M5.Display.println("REBOOTING");
   delay(2000);
   ESP.restart();
 }
@@ -156,17 +150,17 @@ void displayPing(int pingTargetId)
   // only print ping result if we've actually pinged the host
   if (pingTarget_p->pinged)
   {
-    StickCP2.Display.printf("%s: %s\n", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
+    M5.Display.printf("%s: %s\n", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
   }
 }
 
 void displayStatus()
 {
-  StickCP2.Display.setCursor(0, 0, 2);
-  StickCP2.Display.print(statusMsg);
+  M5.Display.setCursor(0, 0, 2);
+  M5.Display.print(statusMsg);
 
   // display ping status of current ping target
-  StickCP2.Display.setCursor(0, 80, 2);
+  M5.Display.setCursor(0, 80, 2);
   if (wifiSetupComplete)
   {
     displayPing(pingTargetNum);
@@ -191,9 +185,9 @@ void secondsUpdate()
         // Skip pinging rvRouter if local mode
         // Poor design: coupled to order of ping target array
         if (LOCAL_MODE == configuredMode)
-          pingTargetNum = 0;
-        else
           pingTargetNum = 1;
+        else
+          pingTargetNum = 0;
       }
 
       doPing(pingTargetNum);
@@ -269,7 +263,7 @@ public:
           udp.onPacket([](AsyncUDPPacket packet)
           {
             // this is a bloody lambda!
-            bool verbose = false;
+            bool verbose = true;
             if (verbose)
             {
               // print each received msg for debug
@@ -297,6 +291,7 @@ public:
       case WIFI_DONE:
         M5.Lcd.setTextColor(TFT_WHITE,TFT_BLACK);
         wifiSetupComplete = true;
+        Serial.println("Configured WiFi");
         return true;  // advance superSm
       default:
         nextState = SCAN; // should never get here
@@ -304,13 +299,14 @@ public:
     return false;
   }
 
-  //! @return true: advance super SM, false: no state change
-  bool buttonPress(ButtonName buttonName, PressType pressType)
+  //! @return true: advance super SM
+  bool buttonPress()
   {
     Serial.println("CANCELLING WIFI"); 
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(0, 0, 2);
     M5.Lcd.println("CANCELLING WIFI"); 
+    delay(1000);
     return true; 
   } 
 private:
@@ -351,7 +347,7 @@ public:
   }
 
   //! @return true: advance super SM, false: no state change
-  bool buttonPress(ButtonName buttonName, PressType pressType)
+  bool buttonPress()
   {
     switch(currentState)
     {
@@ -397,7 +393,7 @@ public:
         else
         {
           Serial.println("Shutdown after timeout");
-          StickCP2.Power.powerOff();
+          M5.Power.powerOff();
           // never reached
         }
         break;
@@ -446,11 +442,11 @@ public:
     {
       case IDLE:
         M5.Lcd.printf("SSID: %s\n",configuredSSID);
-        M5.Lcd.println("M5-long: Configure\nM5: Password");
+        M5.Lcd.println("M5: Configure\nB: Next; PWR: Prev");
         break;
       case SELECT_SSID:
-        M5.Lcd.printf("M5-long - select:\n%s\n",ssidMenu.at(ssidMenuIndex).c_str());
-        M5.Lcd.println("M5: next SSID");
+        M5.Lcd.printf("M5: select:\n%s\n",ssidMenu.at(ssidMenuIndex).c_str());
+        M5.Lcd.println("B: next SSID\nPWR: prev SSID");
         break;
       default:
         nextState = IDLE;
@@ -458,81 +454,88 @@ public:
     return;
   }
 
-  //! @return true: advance super SM, false: no state change
-  bool buttonPress(ButtonName buttonName, PressType pressType)
+  //! @return true: advance super SM, false: no super SM state change
+  bool buttonPress(ButtonCommand buttonCommand)
   {
     switch(currentState)
     {
       case IDLE:
-        if (BUTTON_B == buttonName)
-          return true;  // exit Sm on button B
-        if (BUTTON_M5 == buttonName)
+        if (SELECT == buttonCommand)
         {
-          if (LONG_PRESS == pressType)
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.println("CONFIGURE SSID\nWAIT...");
+
+          int n = scanSsids();  // scan for SSIDs
+          if (n < 1)
           {
-            M5.Lcd.fillScreen(BLACK);
-            M5.Lcd.setCursor(0, 0, 2);
-            M5.Lcd.println("CONFIGURE SSID\nWAIT...");
-
-            int n = scanSsids();  // scan for SSIDs
-            if (n < 1)
-            {
-              M5.Lcd.println("SCAN FAILURE");
-              delay(2000);
-              return true;
-            }
-
-            ssidMenu.clear();
-
-            for(auto i=ssidNames.begin(); i!=ssidNames.end(); ++i)
-            {
-              ssidMenu.push_back(*i);
-              Serial.printf("Pushed %s onto menu\n", (*i).c_str());
-            }
-            ssidMenu.push_back("<Exit>");
-            ssidMenuIndex = 0;
-
-            nextState = SELECT_SSID;
-            Serial.printf("%d entries in SSID menu\n", ssidMenu.size());
-            Serial.printf("ssidSm next State: %s\n", stateNamesArray[nextState]);
+            M5.Lcd.println("SCAN FAILURE");
+            delay(2000);
+            return true;
           }
-          else
-            return true;  // exit SSID, advance super sm
 
-          return false;
+          ssidMenu.clear();
+
+          for(auto i=ssidNames.begin(); i!=ssidNames.end(); ++i)
+          {
+            ssidMenu.push_back(*i);
+            Serial.printf("Pushed %s onto menu\n", (*i).c_str());
+          }
+          ssidMenu.push_back("<Exit>");
+          ssidMenuIndex = 0;
+
+          nextState = SELECT_SSID;
+          Serial.printf("%d entries in SSID menu\n", ssidMenu.size());
+          Serial.printf("ssidSm next State: %s\n", stateNamesArray[nextState]);
+          return false;   // SSID change selected, stay in this sm
         }
+        else if (NEXT == buttonCommand || PREVIOUS == buttonCommand)
+          return true;  // exit Sm on NEXT or PREVIOUS button
+        else            // unknown button
+          Serial.printf("ERROR - unknown button in SsidSm - IDLE\n");
+          return true;  // exit SSID, advance super sm
         break;
       case SELECT_SSID:
-        if (BUTTON_B == buttonName)
-          break;  // ignore button B
-        if (BUTTON_M5 == buttonName)
+        if (SELECT == buttonCommand)
         {
-          if (LONG_PRESS == pressType)
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.printf("SELECTED SSID:\n%s", ssidMenu.at(ssidMenuIndex).c_str());
+          delay(1000);
+          if (ssidMenuIndex == ssidMenu.size()-1)
           {
-            M5.Lcd.fillScreen(BLACK);
-            M5.Lcd.setCursor(0, 0, 2);
-            M5.Lcd.printf("SELECTED SSID:\n%s", ssidMenu.at(ssidMenuIndex).c_str());
-            delay(1000);
-            if (ssidMenuIndex == ssidMenu.size())
-            {
-              nextState = IDLE;
-              return true;  // <exit> was selected
-            }
-            else
-            {
-              saveSelectedSsid(ssidMenu.at(ssidMenuIndex));  // does not return
-            }
+            nextState = IDLE;
+            return true;  // <exit> was selected
           }
           else
           {
-            ++ssidMenuIndex;
-            if (ssidMenuIndex == ssidMenu.size())
-              ssidMenuIndex = 0;
+            saveSelectedSsid(ssidMenu.at(ssidMenuIndex));  // does not return
           }
+        }
+        else if (NEXT == buttonCommand)
+        {
+          Serial.println("NEXT in SsidSm - SELECT_SSID");
+          ++ssidMenuIndex;
+          if (ssidMenuIndex == ssidMenu.size())
+            ssidMenuIndex = 0;
+        }
+        else if (PREVIOUS == buttonCommand)
+        {
+          Serial.println("NEXT in SsidSm - SELECT_SSID");
+          --ssidMenuIndex;
+          if (ssidMenuIndex < 0)
+            ssidMenuIndex = ssidMenu.size()-1;
+        }
+        else
+        {
+          Serial.printf("ERROR - unknown button in SsidSm - SELECT_SSID\n");
+          nextState = IDLE;
+          return true;
         }
         break;
       default:
         nextState = IDLE;
+        return true;
     }
     return false;
   }
@@ -580,12 +583,12 @@ public:
     {
       case IDLE:
         M5.Lcd.printf("Password: %s\n", configuredSSIDPwd);
-        M5.Lcd.println("M5-long: Change\nM5: Factory Reset");
+        M5.Lcd.println("M5: Change\nB: next; PWR: prev");
         break;
       case CHAR_CLASS:
         M5.Lcd.printf("Password: %s\n", newPasswd);
-        M5.Lcd.printf("M5-long - select:\n%s\n",classMenu[classMenuIndex].c_str());
-        M5.Lcd.println("M5: next type");
+        M5.Lcd.printf("M5: select: %s\n",classMenu[classMenuIndex].c_str());
+        M5.Lcd.println("B: next type\nPWR: prev type");
         break;
       case SELECT_CHAR:
         switch (charClass)
@@ -604,8 +607,8 @@ public:
             numberIndex = 0;
         }
         M5.Lcd.printf("Password: %s\n", newPasswd);
-        M5.Lcd.printf("M5-long - select char: %c\n",selectableChar);
-        M5.Lcd.println("M5: next char");
+        M5.Lcd.printf("M5: select char: %c\n",selectableChar);
+        M5.Lcd.println("B: next char\nPWR: prev char");
         break;
       default:
         nextState = IDLE;
@@ -614,113 +617,126 @@ public:
   }
 
   //! @return true: advance super SM, false: no state change
-  bool buttonPress(ButtonName buttonName, PressType pressType)
+  bool buttonPress(ButtonCommand buttonCommand)
   {
-    if (BUTTON_B == buttonName)
-      return true;  // exit Sm on button B
-
     switch (currentState)
     {
       case IDLE:
-        if (BUTTON_M5 == buttonName)
+        if (SELECT == buttonCommand)
         {
-          if (LONG_PRESS == pressType)
-          {
-            M5.Lcd.fillScreen(BLACK);
-            M5.Lcd.setCursor(0, 0, 2);
-            M5.Lcd.println("CHANGE PASSWORD");
-            delay(1000);
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.println("CHANGE PASSWORD");
+          delay(1000);
 
-            nextState = CHAR_CLASS;
-            Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
+          nextState = CHAR_CLASS;
+          Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
 
-            classMenuIndex = 0;
-            newPasswdIndex = 0;
-            alphaIndex = 0;
-            numberIndex = 0;
-            for (int i=0; i<maxEpromStringLen; i++)
-              newPasswd[i] = 0;
-          }
-          else
-          {
-            return true;
-          }
+          classMenuIndex = 0;
+          newPasswdIndex = 0;
+          alphaIndex = 0;
+          numberIndex = 0;
+          for (int i=0; i<maxEpromStringLen; i++)
+            newPasswd[i] = 0;
+        }
+        else
+        {
+          return true;
         }
         break;
       case CHAR_CLASS:
-        if (BUTTON_M5 == buttonName)
+        if (SELECT == buttonCommand)
         {
-          if (LONG_PRESS == pressType)
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          switch (charClass)
           {
-            M5.Lcd.fillScreen(BLACK);
-            M5.Lcd.setCursor(0, 0, 2);
-            switch (charClass)
-            {
-              case LOWER:
-              case UPPER:
-              case NUMBER:
-                M5.Lcd.println("SELECT CHARACTER");
-                delay(1000);
-                nextState = SELECT_CHAR;
-                Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
-                break;
-              case SAVE:
-                M5.Lcd.println("SAVE - REBOOTING");
-                if (configuredMode == LOCAL_MODE)
-                  strncpy(eepromConfig.localPasswd, newPasswd, maxEpromStringLen);
-                else
-                  strncpy(eepromConfig.remotePasswd, newPasswd, maxEpromStringLen);
-                writeEepromConfig();  // Does not return
-                break;  // never reached
-              case BACKSPACE:
-                M5.Lcd.println("BACKSPACE-ERASE");
-                --newPasswdIndex;
-                newPasswd[newPasswdIndex] = 0;
-                break;
-            }
+            case LOWER:
+            case UPPER:
+            case NUMBER:
+              M5.Lcd.println("SELECT CHARACTER");
+              delay(1000);
+              nextState = SELECT_CHAR;
+              Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
+              break;
+            case SAVE:
+              M5.Lcd.println("SAVE - REBOOTING");
+              if (configuredMode == LOCAL_MODE)
+                strncpy(eepromConfig.localPasswd, newPasswd, maxEpromStringLen);
+              else
+                strncpy(eepromConfig.remotePasswd, newPasswd, maxEpromStringLen);
+              writeEepromConfig();  // Does not return
+              break;  // never reached
+            case BACKSPACE:
+              M5.Lcd.println("BACKSPACE-ERASE");
+              --newPasswdIndex;
+              newPasswd[newPasswdIndex] = 0;
+              break;
           }
-          else
-          {
-            ++classMenuIndex;
-            if (classMenuIndex == CHAR_CLASS_END)
-              classMenuIndex = 0;
-            charClass = (CharClassName)classMenuIndex;
-            Serial.printf("classMenuIndex: %d\n", classMenuIndex);
-          }
+        }
+        else if (NEXT == buttonCommand)
+        {
+          ++classMenuIndex;
+          if (classMenuIndex == CHAR_CLASS_END)
+            classMenuIndex = 0;
+          charClass = (CharClassName)classMenuIndex;
+          Serial.printf("classMenuIndex: %d\n", classMenuIndex);
+        }
+        else if (PREVIOUS == buttonCommand)
+        {
+          --classMenuIndex;
+          if (classMenuIndex == 0)
+            classMenuIndex = CHAR_CLASS_END - 1;
+          charClass = (CharClassName)classMenuIndex;
+          Serial.printf("classMenuIndex: %d\n", classMenuIndex);
         }
         break;
       case SELECT_CHAR:
-        if (BUTTON_M5 == buttonName)
+        if (SELECT == buttonCommand)
         {
-          if (LONG_PRESS == pressType)
+          newPasswd[newPasswdIndex++] = selectableChar;
+
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.printf("SELECTED %c\n", selectableChar);
+          Serial.printf("SELECTED character %c\n", selectableChar);
+          delay(1000);
+
+          nextState = CHAR_CLASS;
+          Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
+        }
+        else if (NEXT == buttonCommand)
+        {
+          switch(charClass)
           {
-            newPasswd[newPasswdIndex++] = selectableChar;
-
-            M5.Lcd.fillScreen(BLACK);
-            M5.Lcd.setCursor(0, 0, 2);
-            M5.Lcd.printf("SELECTED %c\n", selectableChar);
-            Serial.printf("SELECTED character %c\n", selectableChar);
-            delay(1000);
-
-            nextState = CHAR_CLASS;
-            Serial.printf("PasswdSm next State: %s\n", stateNamesArray[nextState]);
+            case LOWER:
+            case UPPER:
+              ++alphaIndex;
+              if (alphaIndex == 26)
+                alphaIndex = 0;
+              break;
+            case NUMBER:
+              ++numberIndex;
+              if (numberIndex == 10)
+                numberIndex = 0;
+              break;
           }
-          else
+        }
+        else if (PREVIOUS == buttonCommand)
+        {
+          switch(charClass)
           {
-            switch(charClass)
-            {
-              case LOWER:
-              case UPPER:
-                ++alphaIndex;
-                if (alphaIndex == 26)
-                  alphaIndex = 0;
-                break;
-              case NUMBER:
-                ++numberIndex;
-                if (numberIndex == 10)
-                  numberIndex = 0;
-                break;
-            }
+            case LOWER:
+            case UPPER:
+              --alphaIndex;
+              if (alphaIndex == -1)
+                alphaIndex = 25;
+              break;
+            case NUMBER:
+              --numberIndex;
+              if (numberIndex == 0)
+                numberIndex = 9;
+              break;
           }
         }
         break;
@@ -796,8 +812,8 @@ public:
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.setCursor(0, 0, 2);
         M5.Lcd.printf("Mode: %s\n", configuredMode?"Remote":"Local");
-        M5.Lcd.println("M5-Long: change");
-        M5.Lcd.println("M5: set SSID");
+        M5.Lcd.println("M5: change");
+        M5.Lcd.println("B: next; PWR: prev");
         break;
       case SSID:
         ssidSm.tick();
@@ -808,23 +824,23 @@ public:
       case FACTORY:
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.setCursor(0, 0, 2);
-        M5.Lcd.println("M5-Long: FACTORY RESET");
-        M5.Lcd.println("M5: Status");
+        M5.Lcd.println("M5: FACTORY RESET");
+        M5.Lcd.println("B: next; PWR: prev");
         break;
       default:
         currentState = SYS_STATUS;
     }
   }
 
-  void buttonPress(ButtonName buttonName, PressType pressType)
+  void buttonPress(ButtonCommand buttonCommand)
   {
     bool rv;
-    Serial.printf("FobSuperSm button press name %d type %d in state %s\n"
-                  , buttonName, pressType, stateNamesArray[currentState].c_str());
+    Serial.printf("FobSuperSm button press %d in state %s\n"
+                  , buttonCommand, stateNamesArray[currentState].c_str());
     switch (currentState)
     {
       case WIFI_INIT:
-        rv = wifiInitSm.buttonPress(buttonName, pressType);
+        rv = wifiInitSm.buttonPress();
         if (rv)
         {
           nextState = SYS_STATUS;
@@ -832,47 +848,93 @@ public:
         }
         break;
       case SYS_STATUS:
-        rv = statusButton(buttonName, pressType);
+        rv = statusButton(buttonCommand);
         Serial.printf("button push in FobSuperSm returned %d\n", rv);
-        if (rv)
+        if (rv)   // change super-state
         {
-          nextState = LOCAL_REMOTE;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          if (buttonCommand == NEXT)
+          {
+            nextState = SSID;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
+          else if (buttonCommand == PREVIOUS)
+          {
+            nextState = FACTORY;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
         }
         break;
       case SHUTDOWN:
-        rv = shutdownSm.buttonPress(buttonName, pressType);
+        rv = shutdownSm.buttonPress();
         if (rv)
         {
           nextState = SYS_STATUS;
           Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
-      case LOCAL_REMOTE:
-        modeButton(buttonName, pressType);  // does not return from long press
-        nextState = SSID;
-        Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-        break;
       case SSID:
-        rv = ssidSm.buttonPress(buttonName, pressType);
+        rv = ssidSm.buttonPress(buttonCommand);
         if (rv)
         {
-          nextState = PASSWD;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          if (buttonCommand == NEXT)
+          {
+            nextState = PASSWD;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
+          else if (buttonCommand == PREVIOUS)
+          {
+            nextState = SYS_STATUS;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
         }
         break;
       case PASSWD:
-        rv = passwdSm.buttonPress(buttonName, pressType);
+        rv = passwdSm.buttonPress(buttonCommand);
         if (rv)
         {
-          nextState = FACTORY;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          if (NEXT == buttonCommand)
+          {
+            nextState = LOCAL_REMOTE;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
+          else if (PREVIOUS == buttonCommand)
+          {
+            nextState = SSID;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
+        }
+        break;
+      case LOCAL_REMOTE:
+        rv = modeButton(buttonCommand);  // does not return from SELECT
+        if (rv)
+        {
+          if (NEXT == buttonCommand)
+          {
+            nextState = FACTORY;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
+          else if (PREVIOUS == buttonCommand)
+          {
+            nextState = PASSWD;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
         }
         break;
       case FACTORY:
-        factoryButton(buttonName, pressType);  // does not return from long press
-        nextState = SYS_STATUS;
-        Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        rv = factoryButton(buttonCommand);  // does not return from SELECT
+        if (rv)
+        {
+          if (NEXT == buttonCommand)
+          {
+            nextState = SYS_STATUS;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
+          else if (PREVIOUS == buttonCommand)
+          {
+            nextState = LOCAL_REMOTE;
+            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          }
+        }
         break;
       default:
         nextState = SYS_STATUS;
@@ -888,105 +950,86 @@ private:
   SuperStateName currentState;
   SuperStateName nextState;
 
-  bool statusButton(ButtonName buttonName, PressType pressType);
+  bool statusButton(ButtonCommand buttonCommand);
 
   WifiInitSm wifiInitSm = WifiInitSm();
   ShutdownSm shutdownSm = ShutdownSm();
   SsidSm ssidSm = SsidSm();
   PasswdSm passwdSm = PasswdSm();
 
-  void modeButton(ButtonName buttonName, PressType pressType)
+  bool modeButton(ButtonCommand buttonCommand)
   {
-    Serial.printf("modeButton button press name %d type %d\n", buttonName, pressType);
-    if (BUTTON_B == buttonName)
+    Serial.printf("modeButton button press %d\n", buttonCommand);
+    if (SELECT == buttonCommand)
     {
-      Serial.println("Ignoring button B press");
-      return;
-    }
-    if (BUTTON_M5 == buttonName)
-    {
-      if (LONG_PRESS == pressType)
+      Serial.println("mode change button press");
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setCursor(0, 0, 2);
+      M5.Lcd.println("MODE CHANGE");
+      delay(2000);
+      if (eepromConfig.configuredMode == LOCAL_MODE)
       {
-        Serial.println("mode change button press");
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(0, 0, 2);
-        M5.Lcd.println("MODE CHANGE");
-        delay(2000);
-        if (eepromConfig.configuredMode == LOCAL_MODE)
-        {
-          eepromConfig.configuredMode = REMOTE_MODE;
-        }
-        else
-        {
-          eepromConfig.configuredMode = LOCAL_MODE;
-        }
-        writeEepromConfig();  // does not return
+        eepromConfig.configuredMode = REMOTE_MODE;
       }
+      else
+      {
+        eepromConfig.configuredMode = LOCAL_MODE;
+      }
+      writeEepromConfig();  // does not return
     }
-    return;
+    return true;
   }
 
-  void factoryButton(ButtonName buttonName, PressType pressType)
+  bool factoryButton(ButtonCommand buttonCommand)
   {
-    Serial.printf("factoryButton button press name %d type %d\n", buttonName, pressType);
-    if (BUTTON_B == buttonName)
+    Serial.printf("factoryButton button press %d\n", buttonCommand);
+    if (SELECT == buttonCommand)
     {
-      Serial.println("Ignoring button B press");
-      return;
-    }
-    if (BUTTON_M5 == buttonName)
-    {
-      if (LONG_PRESS == pressType)
-      {
-        Serial.println("Factory reset button press");
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(0, 0, 2);
-        M5.Lcd.println("FACTORY RESET");
-        eepromConfig.magic = (uint16_t)0xbeef;
-        eepromConfig.version = 1;
-        eepromConfig.configuredMode = LOCAL_MODE;
-        strcpy(eepromConfig.configuredLocalSsid, "No SSID");
-        strcpy(eepromConfig.localPasswd, "None");
-        strcpy(eepromConfig.configuredRemoteSsid, "No SSID");
-        strcpy(eepromConfig.remotePasswd, "None");
+      Serial.println("Factory reset button press");
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setCursor(0, 0, 2);
+      M5.Lcd.println("FACTORY RESET");
+      eepromConfig.magic = (uint16_t)0xbeef;
+      eepromConfig.version = 1;
+      eepromConfig.configuredMode = LOCAL_MODE;
+      strcpy(eepromConfig.configuredLocalSsid, "No SSID");
+      strcpy(eepromConfig.localPasswd, "None");
+      strcpy(eepromConfig.configuredRemoteSsid, "No SSID");
+      strcpy(eepromConfig.remotePasswd, "None");
 
-        writeEepromConfig();  // does not return
-      }
+      writeEepromConfig();  // does not return
     }
-    return;
+    else if (NEXT == buttonCommand || PREVIOUS == buttonCommand)
+    {
+      Serial.println("Ignoring button B or PWR press");
+    }
+    return true;
   }
 
 };
 
 //! @return true: advance super SM, false: no state change
 bool
-FobSuperSm::statusButton(ButtonName buttonName, PressType pressType)
+FobSuperSm::statusButton(ButtonCommand buttonCommand)
 {
-  Serial.printf("statusButton button press name %d type %d\n", buttonName, pressType);
-  if (BUTTON_B == buttonName)
+  Serial.printf("statusButton button press %d\n", buttonCommand);
+  if (SELECT == buttonCommand)
   {
-    Serial.println("Ignoring button B press");
+    Serial.println("Toggle power button press");
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0, 0, 2);
+    M5.Lcd.println("TOGGLING POWER");
+    udp.writeTo((uint8_t*)"toggle", 6, linkyM5IP, udpPort);
+    delay(1000);
     return false;
   }
-  if (BUTTON_M5 == buttonName)
+  else if (NEXT == buttonCommand || PREVIOUS == buttonCommand)
   {
-    if (LONG_PRESS == pressType)
-    {
-      Serial.println("Toggle power button press");
-      M5.Lcd.fillScreen(BLACK);
-      M5.Lcd.setCursor(0, 0, 2);
-      M5.Lcd.println("TOGGLING POWER");
-      udp.writeTo((uint8_t*)"toggle", 6, linkyM5IP, udpPort);
-      delay(1000);
-      return false;
-    }
-    else
-    {
-      Serial.print("statusButton short button press in state ");
-      Serial.println(stateNamesArray[currentState]);
-      return true;  // advance to next state
-    }
+    Serial.print("NEXT or PREVIOUS button press in state ");
+    Serial.println(stateNamesArray[currentState]);
+    return true;  // advance to next state
   }
+  return false;   // stay in this state if not asked to move
 }
 
 FobSuperSm fobSuperSm = FobSuperSm();
@@ -1002,15 +1045,15 @@ void printEeprom()
 
 void setup() {
   // initialize M5StickCPlus2
-  StickCP2.begin();
-  StickCP2.Display.setRotation(1);
-  StickCP2.Display.setTextSize(2);
-  StickCP2.Display.setTextColor(TFT_RED,TFT_BLACK);
-  StickCP2.update();
+  M5.begin();
+  M5.Display.setRotation(1);
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(TFT_RED,TFT_BLACK);
+  M5.update();
 
   sprintf(statusMsg, "starting");
 
-  Serial.begin(115200);
+  Serial.begin(9600);
 
   // initialize time
   int64_t now = esp_timer_get_time();
@@ -1024,7 +1067,7 @@ void setup() {
   // Initialize EEPROM
   if (!EEPROM.begin(sizeof(EepromConfig))) {  // Request storage of SIZE size(success return)
     Serial.println("\nFailed to initialize EEPROM!");
-    StickCP2.Display.println("EEPROM Fail\nFactory Reset needed");
+    M5.Display.println("EEPROM Fail\nFactory Reset needed");
     delay(30000);
     fobSuperSm.skipWifiInit();
     return;
@@ -1042,7 +1085,7 @@ void setup() {
   if (eepromConfig.magic != magicValue)
   {
     Serial.println("\nEEPROM not initialized!");
-    StickCP2.Display.println("EEPROM invalid\nFactory Reset needed");
+    M5.Display.println("EEPROM invalid\nFactory Reset needed");
     delay(30000);
     fobSuperSm.skipWifiInit();
     return;
@@ -1069,45 +1112,22 @@ void loop() {
   // Read buttons
   M5.update();
 
-  if (M5.BtnA.wasPressed())
-  {
-    // Initial depression of M5 was detected
-    buttonADownTime = esp_timer_get_time();
-    buttonA = true;
-  }
-
-  if (M5.BtnA.isPressed() && buttonA && !buttonALong)
-  {
-    // M5 button was pressed and is still pressed, check downtime
-    int64_t buttonADuration = esp_timer_get_time() - buttonADownTime;
-    if (buttonADuration > 1000000)
-    {
-      Serial.printf("long buttonA detected after %d us\n", buttonADuration);
-      buttonALong = true;
-      fobSuperSm.buttonPress(BUTTON_M5, LONG_PRESS);
-    }
-  }
-
   if (M5.BtnA.wasReleased())
   {
-    buttonA = false;
-    int64_t buttonADuration = esp_timer_get_time() - buttonADownTime;
-    if (buttonALong)
-    {
-      Serial.printf("long buttonA ended after %d us\n", buttonADuration);
-    }
-    else
-    {
-      Serial.printf("short buttonA %d us\n", buttonADuration);
-      fobSuperSm.buttonPress(BUTTON_M5, SHORT_PRESS);
-    }
-    buttonALong = false;
+    Serial.println("buttonM5");
+    fobSuperSm.buttonPress(SELECT);
   }
 
   if (M5.BtnB.wasReleased())
   {
-    buttonB = true;
     Serial.println("buttonB");
+    fobSuperSm.buttonPress(NEXT);
+  }
+
+  if (M5.BtnPWR.wasReleased())
+  {
+    Serial.println("buttonPWR");
+    fobSuperSm.buttonPress(PREVIOUS);
   }
 
   // Check if it's time to increment the seconds-counter
