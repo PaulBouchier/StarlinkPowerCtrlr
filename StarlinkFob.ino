@@ -263,7 +263,7 @@ public:
           udp.onPacket([](AsyncUDPPacket packet)
           {
             // this is a bloody lambda!
-            bool verbose = true;
+            bool verbose = false;
             if (verbose)
             {
               // print each received msg for debug
@@ -563,8 +563,16 @@ class PasswdSm
 public:
   enum PasswdStateName {IDLE, CHAR_CLASS, SELECT_CHAR};  // SSID choice state names
   String stateNamesArray[3] = {"IDLE", "CHAR_CLASS", "SELECT_CHAR"};
-  enum CharClassName {LOWER, UPPER, NUMBER, SAVE, BACKSPACE, CHAR_CLASS_END};  // add items before CHAR_CLASS_END
-  const String classMenu[CHAR_CLASS_END] = {"lower", "UPPER", "number", "<Save>", "<Backspace>"};
+  enum CharClassName {LOWER, UPPER, NUMBER, SPECIAL, SAVE, BACKSPACE, CHAR_CLASS_END};  // add items before CHAR_CLASS_END
+  const String classMenu[CHAR_CLASS_END] = {"lower", "UPPER", "number", "special", "<Save>", "<DEL>"};
+  static const int numSpecials = 32;
+  const char specialMenuSymbols[numSpecials] = 
+    {
+    '!', '"', '#', '$', '%', '&', '\'', '('
+    , ')', '*', '+', ',', '-', '.', '/', ':'
+    , ';', '<', '=', '>', '?', '@', '[', '\\'
+    , ']', '^', '_', '`', '{', '|', '}', '~' 
+    };
 
   PasswdSm()
   {
@@ -602,9 +610,13 @@ public:
           case NUMBER:
             selectableChar = '0' + numberIndex;
             break;
+          case SPECIAL:
+            selectableChar = specialMenuSymbols[specialIndex];
+            break;
           default:
             alphaIndex = 0;
             numberIndex = 0;
+            specialIndex = 0;
         }
         M5.Lcd.printf("Password: %s\n", newPasswd);
         M5.Lcd.printf("M5: select char: %c\n",selectableChar);
@@ -636,6 +648,8 @@ public:
           newPasswdIndex = 0;
           alphaIndex = 0;
           numberIndex = 0;
+          specialIndex = 0;
+
           for (int i=0; i<maxEpromStringLen; i++)
             newPasswd[i] = 0;
         }
@@ -654,6 +668,7 @@ public:
             case LOWER:
             case UPPER:
             case NUMBER:
+            case SPECIAL:
               M5.Lcd.println("SELECT CHARACTER");
               delay(1000);
               nextState = SELECT_CHAR;
@@ -668,7 +683,7 @@ public:
               writeEepromConfig();  // Does not return
               break;  // never reached
             case BACKSPACE:
-              M5.Lcd.println("BACKSPACE-ERASE");
+              M5.Lcd.println("BACKSPACE");
               --newPasswdIndex;
               newPasswd[newPasswdIndex] = 0;
               break;
@@ -685,7 +700,7 @@ public:
         else if (PREVIOUS == buttonCommand)
         {
           --classMenuIndex;
-          if (classMenuIndex == 0)
+          if (classMenuIndex == -1)
             classMenuIndex = CHAR_CLASS_END - 1;
           charClass = (CharClassName)classMenuIndex;
           Serial.printf("classMenuIndex: %d\n", classMenuIndex);
@@ -720,6 +735,11 @@ public:
               if (numberIndex == 10)
                 numberIndex = 0;
               break;
+            case SPECIAL:
+              ++specialIndex;
+              if (specialIndex == numSpecials)
+                specialIndex = 0;
+              break;
           }
         }
         else if (PREVIOUS == buttonCommand)
@@ -734,8 +754,13 @@ public:
               break;
             case NUMBER:
               --numberIndex;
-              if (numberIndex == 0)
+              if (numberIndex == -1)
                 numberIndex = 9;
+              break;
+            case SPECIAL:
+              --specialIndex;
+              if (specialIndex == -1)
+                specialIndex = numSpecials-1;
               break;
           }
         }
@@ -758,6 +783,8 @@ private:
   int alphaIndex;
   const int maxNumberIndex = 9;
   int numberIndex;
+  int specialIndex;
+
 };
 
 class FobSuperSm
