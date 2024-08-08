@@ -10,9 +10,9 @@
 // global enums
 enum ButtonCommand {SELECT, NEXT, PREVIOUS};
 enum LocalRemoteMode {LOCAL_MODE, REMOTE_MODE};
+enum FobMode {FOB_MODE, TELEMETRY_MODE};
 
 // Display variables
-int displayMode = 0;  // 0: voltage, ping, 1: SSID
 char statusMsg[50];
 
 // Time-related variables
@@ -26,8 +26,10 @@ int cancelTimer = cancelDelaySec;
 const int pingPeriod = 4;
 
 // EEPROM variables
+#define EEPROM_VERSION 3
 const uint16_t magicValue = 0xbeef;
 const int maxEpromStringLen = 32;
+FobMode fobMode;
 LocalRemoteMode configuredMode;
 char configuredSSID[maxEpromStringLen];
 char configuredSSIDPwd[maxEpromStringLen];
@@ -35,7 +37,9 @@ char configuredSSIDPwd[maxEpromStringLen];
 struct EepromConfig {
   uint16_t magic;
   int version;
+  FobMode fobMode;
   LocalRemoteMode configuredMode;
+  bool midnightOff;
   char configuredLocalSsid[maxEpromStringLen];
   char localPasswd[maxEpromStringLen];
   char configuredRemoteSsid[maxEpromStringLen];
@@ -229,7 +233,7 @@ public:
         else
         {
           M5.Lcd.setCursor(0, 0, 2);
-          M5.Lcd.println("M5-Long:\n  exit SCAN");
+          M5.Lcd.println("M5: EXIT SCAN");
           M5.update();
           delay(2000);
           if (M5.BtnA.isPressed())
@@ -1021,7 +1025,9 @@ private:
       M5.Lcd.setCursor(0, 0, 2);
       M5.Lcd.println("FACTORY RESET");
       eepromConfig.magic = (uint16_t)0xbeef;
-      eepromConfig.version = 1;
+      eepromConfig.version = EEPROM_VERSION;
+      eepromConfig.fobMode = FOB_MODE;
+      eepromConfig.midnightOff = false;
       eepromConfig.configuredMode = LOCAL_MODE;
       strcpy(eepromConfig.configuredLocalSsid, "No SSID");
       strcpy(eepromConfig.localPasswd, "None");
@@ -1067,7 +1073,8 @@ FobSuperSm fobSuperSm = FobSuperSm();
 
 void printEeprom()
 {
-  Serial.printf("0x%x %d %d\n", eepromConfig.magic, eepromConfig.version, eepromConfig.configuredMode);
+  Serial.printf("0x%x %d %d %d %d\n", eepromConfig.magic, eepromConfig.version
+  , eepromConfig.fobMode, eepromConfig.midnightOff, eepromConfig.configuredMode);
   Serial.println(eepromConfig.configuredLocalSsid);
   Serial.println(eepromConfig.localPasswd);
   Serial.println(eepromConfig.configuredRemoteSsid);
@@ -1113,7 +1120,7 @@ void setup() {
 
   printEeprom();
 
-  if (eepromConfig.magic != magicValue)
+  if (eepromConfig.magic != magicValue || eepromConfig.version != EEPROM_VERSION)
   {
     Serial.println("\nEEPROM not initialized!");
     M5.Display.println("EEPROM invalid\nFactory Reset needed");
