@@ -300,14 +300,18 @@ public:
   }
 
   //! @return true: advance super SM
-  bool buttonPress()
+  bool buttonPress(ButtonCommand buttonCommand)
   {
-    Serial.println("CANCELLING WIFI"); 
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setCursor(0, 0, 2);
-    M5.Lcd.println("CANCELLING WIFI"); 
-    delay(1000);
-    return true; 
+    if (SELECT == buttonCommand)
+    {
+      Serial.println("CANCELLING WIFI"); 
+      M5.Lcd.fillScreen(BLACK);
+      M5.Lcd.setCursor(0, 0, 2);
+      M5.Lcd.println("CANCELLING WIFI"); 
+      delay(1000);
+      return true; 
+    }
+    return false;
   } 
 private:
   WifiStateName currentState;
@@ -867,7 +871,7 @@ public:
     switch (currentState)
     {
       case WIFI_INIT:
-        rv = wifiInitSm.buttonPress();
+        rv = wifiInitSm.buttonPress(buttonCommand);
         if (rv)
         {
           nextState = SYS_STATUS;
