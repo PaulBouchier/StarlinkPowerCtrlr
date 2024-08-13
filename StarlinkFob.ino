@@ -7,10 +7,31 @@
 #include <ESP32Ping.h>
 #include <vector>
 
+// Telemetry mode GPIOs & voltage constants
+#define ADC_PIN 36
+#define STARLINK_POWER_PIN 26
+
+#define ADC_10V 957
+#define ADC_15V 1519
+#define ADC_15_10V (ADC_15V - ADC_10V)
+#define DELTA_V_REF 5.0
+
+// battery voltage variables
+const int avgArraySize = 10;
+const double lowVLimit = 12.5;
+const double shutdownVLimit = 5.0;
+double batteryVolts;
+int avgArrayIndex = 0;
+double batteryVoltsArray[avgArraySize];  // array of last n voltage measurements used for trailing average
+
+// power control variables
+bool powerEnableStatus;  // currrent power-enable state
+
 // global enums
 enum ButtonCommand {SELECT, NEXT, PREVIOUS};
-enum LocalRemoteMode {LOCAL_MODE, REMOTE_MODE};
-enum FobMode {FOB_MODE, TELEMETRY_MODE};
+enum DeviceMode {LOCAL_FOB_MODE, REMOTE_FOB_MODE, BATTERY_MON_MODE};
+String DeviceModeText[3] = {String("Local FOB"), String("Remote FOB"), String("Battery Monitor")};
+DeviceMode configuredMode;
 
 // Display variables
 char statusMsg[50];
@@ -24,21 +45,24 @@ int poweroffTimer = initialPoweroffTime;
 const int cancelDelaySec = 60;
 int cancelTimer = cancelDelaySec;
 const int pingPeriod = 4;
+int lastHour = 0;
+bool midnightOff = false;
+
+// RTC time variables
+m5::rtc_time_t RTC_TimeStruct;
+m5::rtc_date_t RTC_DateStruct;
 
 // EEPROM variables
 #define EEPROM_VERSION 3
 const uint16_t magicValue = 0xbeef;
 const int maxEpromStringLen = 32;
-FobMode fobMode;
-LocalRemoteMode configuredMode;
 char configuredSSID[maxEpromStringLen];
 char configuredSSIDPwd[maxEpromStringLen];
 
 struct EepromConfig {
   uint16_t magic;
   int version;
-  FobMode fobMode;
-  LocalRemoteMode configuredMode;
+  DeviceMode configuredMode;
   bool midnightOff;
   char configuredLocalSsid[maxEpromStringLen];
   char localPasswd[maxEpromStringLen];
@@ -175,7 +199,7 @@ void displayStatus()
   }
 }
 
-void secondsUpdate()
+void sequencePings()
 {
   // Ping hosts and record live-ness
   // Note: Ping has to come before UDP send/receive or ESP32 crashes
@@ -188,7 +212,7 @@ void secondsUpdate()
       {
         // Skip pinging rvRouter if local mode
         // Poor design: coupled to order of ping target array
-        if (LOCAL_MODE == configuredMode)
+        if (LOCAL_FOB_MODE == configuredMode)
           pingTargetNum = 1;
         else
           pingTargetNum = 0;
@@ -234,16 +258,7 @@ public:
         {
           M5.Lcd.setCursor(0, 0, 2);
           M5.Lcd.println("M5: EXIT SCAN");
-          M5.update();
-          delay(2000);
-          if (M5.BtnA.isPressed())
-          {
-            Serial.println("CANCELLING WIFI from inside ssidSm"); 
-            M5.Lcd.fillScreen(BLACK);
-            M5.Lcd.setCursor(0, 0, 2);
-            M5.Lcd.println("CANCELLING WIFI"); 
-            return true; 
-          }
+          updateNextLoopTime();  // allow loop to cycle before rescanning
         }
         break;
       case CONNECTING:
@@ -343,6 +358,118 @@ private:
   }
 };
 
+class SetModeSm
+{
+public:
+  enum SetModeStateName {IDLE, SET_LOCAL_FOB, SET_REMOTE_FOB, SET_BATT_MON};  // SSID choice state names
+  String stateNamesArray[4] = {"IDLE", "SET_LOCAL_FOB", "SET_REMOTE_FOB", "SET_BATT_MON"};  // Device mode
+
+  SetModeSm()
+  {
+    currentState = IDLE;
+    nextState = IDLE;
+  }
+
+  // display mode selection prompts
+  bool tick()
+  {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0, 0, 2);
+
+    currentState = nextState;
+    switch(currentState)
+    {
+      case IDLE:
+        M5.Lcd.printf("Current mode:\n%s\n", DeviceModeText[configuredMode]);
+        M5.Lcd.println("M5: CHANGE\nB: Next; PWR: Prev");
+        break;
+      case SET_LOCAL_FOB:
+        M5.Lcd.printf("M5: set mode:\n%s\nB: Next; PWR: Prev", DeviceModeText[LOCAL_FOB_MODE]);
+        break;
+      case SET_REMOTE_FOB:
+        M5.Lcd.printf("M5: set mode:\n%s\nB: Next; PWR: Prev", DeviceModeText[REMOTE_FOB_MODE]);
+        Serial.printf("M5: set mode:\n%s\nB: Next; PWR: Prev", DeviceModeText[REMOTE_FOB_MODE]);
+        break;
+      case SET_BATT_MON:
+        // for some unknown reason, printf(DeviceModeText[BATT....]) printed corrupt data but println is ok
+        M5.Lcd.println("M5: set mode:");
+        M5.Lcd.println(DeviceModeText[BATTERY_MON_MODE]);
+        M5.Lcd.println("B: Next; PWR: Prev");
+        break;
+      default:
+        currentState = IDLE;
+        nextState = IDLE;
+    }
+    return false;
+  }
+
+  //! @return true: advance super SM, false: no state change
+  // no return from Select
+  bool buttonPress(ButtonCommand buttonCommand)
+  {
+    switch(currentState)
+    {
+      case IDLE:
+        if (SELECT == buttonCommand)
+        {
+          nextState = SET_LOCAL_FOB;
+
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.println("CHANGE MODE");
+          delay(2000);
+          return false;
+        }
+        else
+          return true;  // NEXT or PREV change major states
+        break;
+      case SET_LOCAL_FOB:
+        if (SELECT == buttonCommand)
+        {
+          Serial.println("SET LOCAL FOB mode");
+          eepromConfig.configuredMode = LOCAL_FOB_MODE;
+          // writeEepromConfig(); // Does not return
+        }
+        else if (NEXT == buttonCommand)
+          nextState = SET_REMOTE_FOB;
+        else
+          nextState = IDLE;  // PREVIOUS
+        break;
+      case SET_REMOTE_FOB:
+        if (SELECT == buttonCommand)
+        {
+          Serial.println("SET REMOTE FOB mode");
+          eepromConfig.configuredMode = REMOTE_FOB_MODE;
+          // writeEepromConfig(); // Does not return
+        }
+        else if (NEXT == buttonCommand)
+        {
+          nextState = SET_BATT_MON;
+        }
+        else
+          nextState = SET_LOCAL_FOB;  // PREVIOUS
+        break;
+      case SET_BATT_MON:
+        if (SELECT == buttonCommand)
+        {
+          Serial.println("SET BATT MON mode");
+          eepromConfig.configuredMode = BATTERY_MON_MODE;
+          // writeEepromConfig(); // Does not return
+        }
+        else if (NEXT == buttonCommand)
+          nextState = IDLE;
+        else
+          nextState = SET_REMOTE_FOB;  // PREVIOUS
+        break;
+    }
+    return false;
+  }
+
+private:
+  SetModeStateName currentState;
+  SetModeStateName nextState;
+};
+
 class ShutdownSm
 {
 public:
@@ -418,7 +545,7 @@ public:
 private:
   ShutdownStateName currentState;
   ShutdownStateName nextState;
-  String stateNamesArray[3] = {"TIMING", "TIMEOUT"};
+  String stateNamesArray[2] = {"TIMING", "TIMEOUT"};
 
   const int initialPoweroffTime = 120;
   int poweroffTimer = initialPoweroffTime;
@@ -557,7 +684,7 @@ private:
   void saveSelectedSsid(String ssid)
   {
     Serial.printf("Writing SSID %s to EEPROM for mode %d\n", ssid.c_str(), configuredMode);
-    if (LOCAL_MODE == configuredMode)
+    if (LOCAL_FOB_MODE == configuredMode)
       strncpy(eepromConfig.configuredLocalSsid, ssid.c_str(), maxEpromStringLen);
     else
       strncpy(eepromConfig.configuredRemoteSsid, ssid.c_str(), maxEpromStringLen);
@@ -684,7 +811,7 @@ public:
               break;
             case SAVE:
               M5.Lcd.println("SAVE - REBOOTING");
-              if (configuredMode == LOCAL_MODE)
+              if (configuredMode == LOCAL_FOB_MODE)
                 strncpy(eepromConfig.localPasswd, newPasswd, maxEpromStringLen);
               else
                 strncpy(eepromConfig.remotePasswd, newPasswd, maxEpromStringLen);
@@ -798,8 +925,8 @@ private:
 class FobSuperSm
 {
 public:
-  enum SuperStateName {WIFI_INIT, SYS_STATUS, SHUTDOWN, LOCAL_REMOTE, SSID, PASSWD, FACTORY}; // Superstate state names
-  String stateNamesArray[7] = {"WIFI_INIT", "SYS_STATUS", "SHUTDOWN", "LOCAL_REMOTE", "SSID", "PASSWD", "FACTORY"};
+  enum SuperStateName {WIFI_INIT, FOB_STATUS, BATT_MON_STATUS, SHUTDOWN, SET_MODE, SSID, PASSWD, FACTORY}; // Superstate state names
+  String stateNamesArray[8] = {"WIFI_INIT", "FOB_STATUS", "BATT_MON_STATUS", "SHUTDOWN", "SET_MODE", "SSID", "PASSWD", "FACTORY"};
 
   FobSuperSm()
   {
@@ -810,6 +937,7 @@ public:
   void tick()
   {
     bool rv;
+
     currentState = nextState;
     switch (currentState)
     {
@@ -817,11 +945,12 @@ public:
         rv = wifiInitSm.tick();
         if (rv)
         {
-          nextState = SYS_STATUS;
+          nextState = FOB_STATUS;
           Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
-      case SYS_STATUS:
+      case FOB_STATUS:
+        sequencePings();
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.setCursor(0, 0, 2);
 
@@ -843,12 +972,8 @@ public:
       case SHUTDOWN:
         shutdownSm.tick();  // run the cancel timer
         break;
-      case LOCAL_REMOTE:
-        M5.Lcd.fillScreen(BLACK);
-        M5.Lcd.setCursor(0, 0, 2);
-        M5.Lcd.printf("Mode: %s\n", configuredMode?"Remote":"Local");
-        M5.Lcd.println("M5: change");
-        M5.Lcd.println("B: next; PWR: prev");
+      case SET_MODE:
+        setModeSm.tick();
         break;
       case SSID:
         ssidSm.tick();
@@ -863,7 +988,7 @@ public:
         M5.Lcd.println("B: next; PWR: prev");
         break;
       default:
-        currentState = SYS_STATUS;
+        currentState = FOB_STATUS;
     }
   }
 
@@ -878,11 +1003,11 @@ public:
         rv = wifiInitSm.buttonPress(buttonCommand);
         if (rv)
         {
-          nextState = SYS_STATUS;
+          nextState = FOB_STATUS;
           Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
-      case SYS_STATUS:
+      case FOB_STATUS:
         rv = statusButton(buttonCommand);
         Serial.printf("button push in FobSuperSm returned %d\n", rv);
         if (rv)   // change super-state
@@ -903,7 +1028,7 @@ public:
         rv = shutdownSm.buttonPress();
         if (rv)
         {
-          nextState = SYS_STATUS;
+          nextState = FOB_STATUS;
           Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
@@ -918,7 +1043,7 @@ public:
           }
           else if (buttonCommand == PREVIOUS)
           {
-            nextState = SYS_STATUS;
+            nextState = FOB_STATUS;
             Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
           }
         }
@@ -929,7 +1054,7 @@ public:
         {
           if (NEXT == buttonCommand)
           {
-            nextState = LOCAL_REMOTE;
+            nextState = SET_MODE;
             Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
           }
           else if (PREVIOUS == buttonCommand)
@@ -939,8 +1064,8 @@ public:
           }
         }
         break;
-      case LOCAL_REMOTE:
-        rv = modeButton(buttonCommand);  // does not return from SELECT
+      case SET_MODE:
+        rv = setModeSm.buttonPress(buttonCommand);
         if (rv)
         {
           if (NEXT == buttonCommand)
@@ -961,24 +1086,24 @@ public:
         {
           if (NEXT == buttonCommand)
           {
-            nextState = SYS_STATUS;
+            nextState = FOB_STATUS;
             Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
           }
           else if (PREVIOUS == buttonCommand)
           {
-            nextState = LOCAL_REMOTE;
+            nextState = SET_MODE;
             Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
           }
         }
         break;
       default:
-        nextState = SYS_STATUS;
+        nextState = FOB_STATUS;
     }
   }
 
   void skipWifiInit()
   {
-    nextState = SYS_STATUS;
+    nextState = FOB_STATUS;
   }
 
 private:
@@ -991,7 +1116,9 @@ private:
   ShutdownSm shutdownSm = ShutdownSm();
   SsidSm ssidSm = SsidSm();
   PasswdSm passwdSm = PasswdSm();
+  SetModeSm setModeSm = SetModeSm();
 
+#if 0
   bool modeButton(ButtonCommand buttonCommand)
   {
     Serial.printf("modeButton button press %d\n", buttonCommand);
@@ -1002,18 +1129,19 @@ private:
       M5.Lcd.setCursor(0, 0, 2);
       M5.Lcd.println("MODE CHANGE");
       delay(2000);
-      if (eepromConfig.configuredMode == LOCAL_MODE)
+      if (eepromConfig.configuredMode == LOCAL_FOB_MODE)
       {
-        eepromConfig.configuredMode = REMOTE_MODE;
+        eepromConfig.configuredMode = REMOTE_FOB_MODE;
       }
       else
       {
-        eepromConfig.configuredMode = LOCAL_MODE;
+        eepromConfig.configuredMode = LOCAL_FOB_MODE;
       }
       writeEepromConfig();  // does not return
     }
     return true;
   }
+#endif
 
   bool factoryButton(ButtonCommand buttonCommand)
   {
@@ -1026,9 +1154,8 @@ private:
       M5.Lcd.println("FACTORY RESET");
       eepromConfig.magic = (uint16_t)0xbeef;
       eepromConfig.version = EEPROM_VERSION;
-      eepromConfig.fobMode = FOB_MODE;
       eepromConfig.midnightOff = false;
-      eepromConfig.configuredMode = LOCAL_MODE;
+      eepromConfig.configuredMode = LOCAL_FOB_MODE;
       strcpy(eepromConfig.configuredLocalSsid, "No SSID");
       strcpy(eepromConfig.localPasswd, "None");
       strcpy(eepromConfig.configuredRemoteSsid, "No SSID");
@@ -1074,7 +1201,7 @@ FobSuperSm fobSuperSm = FobSuperSm();
 void printEeprom()
 {
   Serial.printf("0x%x %d %d %d %d\n", eepromConfig.magic, eepromConfig.version
-  , eepromConfig.fobMode, eepromConfig.midnightOff, eepromConfig.configuredMode);
+  , eepromConfig.midnightOff, eepromConfig.configuredMode);
   Serial.println(eepromConfig.configuredLocalSsid);
   Serial.println(eepromConfig.localPasswd);
   Serial.println(eepromConfig.configuredRemoteSsid);
@@ -1130,7 +1257,7 @@ void setup() {
   }
 
   configuredMode = eepromConfig.configuredMode;
-  if (LOCAL_MODE == configuredMode)
+  if (LOCAL_FOB_MODE == configuredMode || BATTERY_MON_MODE == configuredMode)
   {
     strncpy(configuredSSID, eepromConfig.configuredLocalSsid, maxEpromStringLen);
     strncpy(configuredSSIDPwd, eepromConfig.localPasswd, maxEpromStringLen);
@@ -1142,6 +1269,15 @@ void setup() {
   }
 
   Serial.printf("configuredMode: %d SSID: %s\n", configuredMode, configuredSSID);
+}
+
+// Some operations, like scan ssids, take more than 1 second
+// so FobSuperSm is late to return and loop doesn't get to spin
+// and detect button pushes. If called, this method ensures a
+// period where loop() idles to allow display and buttons
+void updateNextLoopTime()
+{
+  nextSecondTime = esp_timer_get_time() + 1000000;
 }
 
 void loop() {
@@ -1176,7 +1312,6 @@ void loop() {
     secondsSinceStart++;
     nextSecondTime = now_us + 1000000;
     // Serial.printf("%lld toggleTime: %d state %d\n", secondsSinceStart, nextFlowToggleTime, generateFlowPulses);
-    secondsUpdate();
     fobSuperSm.tick();
   }
 }
