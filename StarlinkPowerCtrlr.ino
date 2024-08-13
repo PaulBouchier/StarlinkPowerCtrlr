@@ -7,7 +7,7 @@
 #include <ESP32Ping.h>
 #include <vector>
 
-// Telemetry mode GPIOs & voltage constants
+// Battery Monitor mode GPIOs & voltage constants
 #define ADC_PIN 36
 #define STARLINK_POWER_PIN 26
 

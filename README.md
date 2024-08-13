@@ -1,7 +1,7 @@
 # StarlinkFob
 
-The Starlink Fob is a handheld device for toggling power
-to the Starlink antenna, and for displaying battery status. The code runs on an M5StickCPlus that's on the
+The Starlink Power Controller code runs two devices for controlling power
+to the Starlink antenna, and for displaying battery status. The code runs on an M5StickCPlus2 that's on the
 RV wifi network. See the design documentation for a description of the system, and
 Starlink Fob's place in it.
 
@@ -9,6 +9,15 @@ Starlink Fob's place in it.
 
 System design documentation and requirements are at:
 https://sites.google.com/site/paulbouchier/home/projects/starlink
+
+## Modes
+
+The Starlink Power Controller code can run in three modes:
+1. Battery Monitor - the M5Stick installed in the battery box turns power to the antenna on/off, and
+reports battery status to the FOB
+2. Local FOB - the M5Stick FOB displays battery status and allows remotely turning antenna power on/off
+3. Remote FOB - the M5Stick FOB connects to a network in the RV which is remote from the battery-box
+network and provides the same capabilities as a local FOB
 
 ## Wifi passwords
 
