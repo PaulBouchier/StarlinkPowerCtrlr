@@ -1,9 +1,9 @@
-# StarlinkFob
+# StarlinkPowerCtrlr
 
 The Starlink Power Controller code runs two devices for controlling power
-to the Starlink antenna, and for displaying battery status. The code runs on an M5StickCPlus2 that's on the
-RV wifi network. See the design documentation for a description of the system, and
-Starlink Fob's place in it.
+to the Starlink antenna, and for displaying battery status. The code runs on two M5StickCPlus2's that are on the
+RV wifi network: the Starlink FOB, and the Starlink Battery Monitor.
+See the design documentation for a description of the system.
 
 ## Design Documentation
 
