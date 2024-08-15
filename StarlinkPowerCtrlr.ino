@@ -272,6 +272,7 @@ void displayPing(int pingTargetId)
 
 void displayStatus()
 {
+  M5.Lcd.fillScreen(BLACK);
   M5.Display.setCursor(0, 0, 2);
   M5.Display.print(statusMsg);
 
