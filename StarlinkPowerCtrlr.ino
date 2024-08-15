@@ -105,6 +105,7 @@ int pingTargetNum = 0;
 
 AsyncUDP udp;
 
+// EEPROM functions
 void writeEepromConfig()
 {
   // write variables to EEPROM
@@ -122,6 +123,7 @@ void writeEepromConfig()
   ESP.restart();
 }
 
+// Networking functions
 int scanSsids()
 {
   Serial.println("Scan start");
@@ -154,51 +156,6 @@ int scanSsids()
   return n;
 }
 
-void doPing(int pingTargetId)
-{
-  PingTarget* pingTarget_p = pingTargetArray[pingTargetId];
-  if (pingTarget_p->useIP)
-  {
-    pingTarget_p->pingOK = Ping.ping(pingTarget_p->pingIP, 1);
-  }
-  else
-  {
-    pingTarget_p->pingOK = Ping.ping(pingTarget_p->fqn.c_str(), 1);
-  }
-  pingTarget_p->pinged = true;
-}
-
-void displayPing(int pingTargetId)
-{
-  if (!wifiSetupComplete)
-    return;
-
-  PingTarget* pingTarget_p = pingTargetArray[pingTargetId];
-
-  // only print ping result if we've actually pinged the host
-  if (pingTarget_p->pinged)
-  {
-    M5.Display.printf("%s: %s\n", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
-  }
-}
-
-void displayStatus()
-{
-  M5.Display.setCursor(0, 0, 2);
-  M5.Display.print(statusMsg);
-
-  // display ping status of current ping target
-  M5.Display.setCursor(0, 80, 2);
-  if (wifiSetupComplete)
-  {
-    displayPing(pingTargetNum);
-  }
-  else
-  {
-    M5.Lcd.println("No Wifi");
-  }
-}
-
 void sequencePings()
 {
   // Ping hosts and record live-ness
@@ -223,15 +180,126 @@ void sequencePings()
   }
 }
 
+void doPing(int pingTargetId)
+{
+  PingTarget* pingTarget_p = pingTargetArray[pingTargetId];
+  if (pingTarget_p->useIP)
+  {
+    pingTarget_p->pingOK = Ping.ping(pingTarget_p->pingIP, 1);
+  }
+  else
+  {
+    pingTarget_p->pingOK = Ping.ping(pingTarget_p->fqn.c_str(), 1);
+  }
+  pingTarget_p->pinged = true;
+}
+
+// Battery and power control functions
+double adc2Volts(int adcReading)
+{
+  double volts = 10.0 + (DELTA_V_REF / ADC_15_10V) * (adcReading - ADC_10V);
+  // Serial.println(volts);
+  return volts;
+}
+
+double readVolts()
+{
+  double v = 0.0;
+  // read voltage & compute display value
+  int adcValue = analogRead(ADC_PIN);
+  double currentBatteryVolts = adc2Volts(adcValue);
+  batteryVoltsArray[avgArrayIndex++] = currentBatteryVolts;
+  avgArrayIndex %= avgArraySize;
+  // compute trailing average of battery voltage measurements
+  for (int i=0; i<avgArraySize; i++)
+    v += batteryVoltsArray[i];
+  v /= avgArraySize;
+  // Serial.printf("current voltage: %0.2f averge: %0.2f\n", currentBatteryVolts, v);
+  return v;
+}
+
+void setPowerEnable(bool enable)
+{
+  if (enable != powerEnableStatus)
+  {
+    if (true == enable)
+    {
+      digitalWrite(STARLINK_POWER_PIN, HIGH);
+      powerEnableStatus = true;
+    }
+    else
+    {
+      digitalWrite(STARLINK_POWER_PIN, LOW);
+      powerEnableStatus = false;
+    }
+    Serial.printf("setPowerEnable(): enable: %d, powerEnableStatus %d\n", enable, powerEnableStatus);
+  }
+}
+
+// @brief If it's midnight, turn power off if midnightOff is true
+void midnightCheck()
+{
+  int currentHour = RTC_TimeStruct.hours;
+  if (currentHour != lastHour)
+  {
+    Serial.printf("New hour: %d\n", currentHour);
+
+    if (0 == currentHour)
+    {
+      Serial.println("Midnight");
+      if (midnightOff)
+        setPowerEnable(false);
+    }
+    
+    lastHour = currentHour;
+  }
+}
+
+// status display functions
+void displayPing(int pingTargetId)
+{
+  if (!wifiSetupComplete)
+    return;
+
+  PingTarget* pingTarget_p = pingTargetArray[pingTargetId];
+
+  // only print ping result if we've actually pinged the host
+  if (pingTarget_p->pinged)
+  {
+    M5.Display.printf("%s: %s\n", pingTarget_p->displayHostname.c_str(), pingTarget_p->pingOK?"OK":"FAIL");
+  }
+}
+
+void displayStatus()
+{
+  M5.Display.setCursor(0, 0, 2);
+  M5.Display.print(statusMsg);
+
+  // display ping status of current ping target
+  M5.Display.setCursor(0, 80, 2);
+  if (wifiSetupComplete)
+  {
+    if (BATTERY_MON_MODE != configuredMode)
+    {
+      displayPing(pingTargetNum);
+    }
+  }
+  else
+  {
+    M5.Lcd.println("No Wifi");
+  }
+}
+
 class WifiInitSm
 {
 public:
-  enum WifiStateName {SCAN, CONNECTING, UDP, WIFI_DONE};  // SSID choice state names
+  enum WifiStateName {IDLE, SCAN, CONNECTING, UDP, WIFI_DONE};  // SSID choice state names
+  String stateNamesArray[5] = {"WiFi IDLE", "SCAN", "CONNECTING", "UDP", "WIFI_DONE"};
 
   WifiInitSm()
   {
-    currentState = SCAN;
-    nextState = SCAN;
+    currentState = IDLE;
+    nextState = IDLE;
   }
 
   //! @return true: advance super SM, false: no state change
@@ -244,6 +312,13 @@ public:
 
     switch(currentState)
     {
+      case IDLE:
+        // Set WiFi to station mode and disconnect from an AP if it was previously connected.
+        WiFi.mode(WIFI_STA);
+        WiFi.disconnect();
+        delay(100);
+        nextState = SCAN;
+        break;
       case SCAN:
         if (findConfiguredNetwork())
         {
@@ -251,14 +326,25 @@ public:
           Serial.print(configuredSSID);
           Serial.print(" with passwd: ");
           Serial.println(configuredSSIDPwd);
-          WiFi.begin(configuredSSID, configuredSSIDPwd);
+          if (BATTERY_MON_MODE == configuredMode)
+          {
+            // set static IP for battery monitor M5Stick
+            if (!WiFi.config(linkyM5IP, linkyRouterIP, subnet, primaryDNS, secondaryDNS)) 
+            {
+              Serial.println("STA Failed to configure");
+              delay(1000);
+              return(true);  //Advance to status state with no wifi
+            }
+          }
+          WiFi.begin(configuredSSID, configuredSSIDPwd);  // connect to network
           nextState = CONNECTING;
         }
         else
         {
+          // couldn't find configured SSID
           M5.Lcd.setCursor(0, 0, 2);
           M5.Lcd.println("M5: EXIT SCAN");
-          updateNextLoopTime();  // allow loop to cycle before rescanning
+          resetNextTickTime();  // allow loop to cycle before rescanning
         }
         break;
       case CONNECTING:
@@ -295,14 +381,31 @@ public:
               Serial.println();
             }
 
-            // save received msg into statusMsg
-            int i;
-            uint8_t *msg_p = packet.data();
-            for(i=0; i<packet.length(); i++)
+            if (BATTERY_MON_MODE == configuredMode)
             {
-              statusMsg[i] = static_cast<char>(*msg_p++);
+              // test what command came in from FOB and react
+              if (!strncmp("status", (char*)packet.data(), 6))
+              {
+                Serial.println("Got status request");
+                udp.writeTo((uint8_t*)statusMsg, strnlen(statusMsg, sizeof(statusMsg)), packet.remoteIP(), udpPort);
+              }
+              else if (!strncmp("toggle", (char*)packet.data(), 6))
+              {
+                Serial.println("Got toggle request");
+                setPowerEnable(!powerEnableStatus);
+              }
             }
-            statusMsg[i] = '\0';
+            else
+            {
+              // save msg received from Battery M5Stick into statusMsg for display
+              int i;
+              uint8_t *msg_p = packet.data();
+              for(i=0; i<packet.length(); i++)
+              {
+                statusMsg[i] = static_cast<char>(*msg_p++);
+              }
+              statusMsg[i] = '\0';
+            }
           });
         }
         nextState = WIFI_DONE;
@@ -335,7 +438,6 @@ public:
 private:
   WifiStateName currentState;
   WifiStateName nextState;
-  String stateNamesArray[4] = {"SCAN", "CONNECTING", "UDP", "WIFI_DONE"};
 
   bool findConfiguredNetwork()
   {
@@ -356,118 +458,6 @@ private:
 
     return false;
   }
-};
-
-class SetModeSm
-{
-public:
-  enum SetModeStateName {IDLE, SET_LOCAL_FOB, SET_REMOTE_FOB, SET_BATT_MON};  // SSID choice state names
-  String stateNamesArray[4] = {"IDLE", "SET_LOCAL_FOB", "SET_REMOTE_FOB", "SET_BATT_MON"};  // Device mode
-
-  SetModeSm()
-  {
-    currentState = IDLE;
-    nextState = IDLE;
-  }
-
-  // display mode selection prompts
-  bool tick()
-  {
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setCursor(0, 0, 2);
-
-    currentState = nextState;
-    switch(currentState)
-    {
-      case IDLE:
-        M5.Lcd.printf("Current mode:\n%s\n", DeviceModeText[configuredMode]);
-        M5.Lcd.println("M5: CHANGE\nB: Next; PWR: Prev");
-        break;
-      case SET_LOCAL_FOB:
-        M5.Lcd.printf("M5: set mode:\n%s\nB: Next; PWR: Prev", DeviceModeText[LOCAL_FOB_MODE]);
-        break;
-      case SET_REMOTE_FOB:
-        M5.Lcd.printf("M5: set mode:\n%s\nB: Next; PWR: Prev", DeviceModeText[REMOTE_FOB_MODE]);
-        Serial.printf("M5: set mode:\n%s\nB: Next; PWR: Prev", DeviceModeText[REMOTE_FOB_MODE]);
-        break;
-      case SET_BATT_MON:
-        // for some unknown reason, printf(DeviceModeText[BATT....]) printed corrupt data but println is ok
-        M5.Lcd.println("M5: set mode:");
-        M5.Lcd.println(DeviceModeText[BATTERY_MON_MODE]);
-        M5.Lcd.println("B: Next; PWR: Prev");
-        break;
-      default:
-        currentState = IDLE;
-        nextState = IDLE;
-    }
-    return false;
-  }
-
-  //! @return true: advance super SM, false: no state change
-  // no return from Select
-  bool buttonPress(ButtonCommand buttonCommand)
-  {
-    switch(currentState)
-    {
-      case IDLE:
-        if (SELECT == buttonCommand)
-        {
-          nextState = SET_LOCAL_FOB;
-
-          M5.Lcd.fillScreen(BLACK);
-          M5.Lcd.setCursor(0, 0, 2);
-          M5.Lcd.println("CHANGE MODE");
-          delay(2000);
-          return false;
-        }
-        else
-          return true;  // NEXT or PREV change major states
-        break;
-      case SET_LOCAL_FOB:
-        if (SELECT == buttonCommand)
-        {
-          Serial.println("SET LOCAL FOB mode");
-          eepromConfig.configuredMode = LOCAL_FOB_MODE;
-          // writeEepromConfig(); // Does not return
-        }
-        else if (NEXT == buttonCommand)
-          nextState = SET_REMOTE_FOB;
-        else
-          nextState = IDLE;  // PREVIOUS
-        break;
-      case SET_REMOTE_FOB:
-        if (SELECT == buttonCommand)
-        {
-          Serial.println("SET REMOTE FOB mode");
-          eepromConfig.configuredMode = REMOTE_FOB_MODE;
-          // writeEepromConfig(); // Does not return
-        }
-        else if (NEXT == buttonCommand)
-        {
-          nextState = SET_BATT_MON;
-        }
-        else
-          nextState = SET_LOCAL_FOB;  // PREVIOUS
-        break;
-      case SET_BATT_MON:
-        if (SELECT == buttonCommand)
-        {
-          Serial.println("SET BATT MON mode");
-          eepromConfig.configuredMode = BATTERY_MON_MODE;
-          // writeEepromConfig(); // Does not return
-        }
-        else if (NEXT == buttonCommand)
-          nextState = IDLE;
-        else
-          nextState = SET_REMOTE_FOB;  // PREVIOUS
-        break;
-    }
-    return false;
-  }
-
-private:
-  SetModeStateName currentState;
-  SetModeStateName nextState;
 };
 
 class ShutdownSm
@@ -725,7 +715,7 @@ public:
     switch(currentState)
     {
       case IDLE:
-        M5.Lcd.printf("Password: %s\n", configuredSSIDPwd);
+        M5.Lcd.printf("Password:\n%s\n", configuredSSIDPwd);
         M5.Lcd.println("M5: Change\nB: next; PWR: prev");
         break;
       case CHAR_CLASS:
@@ -811,7 +801,7 @@ public:
               break;
             case SAVE:
               M5.Lcd.println("SAVE - REBOOTING");
-              if (configuredMode == LOCAL_FOB_MODE)
+              if (configuredMode == LOCAL_FOB_MODE || configuredMode == BATTERY_MON_MODE)
                 strncpy(eepromConfig.localPasswd, newPasswd, maxEpromStringLen);
               else
                 strncpy(eepromConfig.remotePasswd, newPasswd, maxEpromStringLen);
@@ -922,13 +912,277 @@ private:
 
 };
 
-class FobSuperSm
+class SetModeSm
 {
 public:
-  enum SuperStateName {WIFI_INIT, FOB_STATUS, BATT_MON_STATUS, SHUTDOWN, SET_MODE, SSID, PASSWD, FACTORY}; // Superstate state names
-  String stateNamesArray[8] = {"WIFI_INIT", "FOB_STATUS", "BATT_MON_STATUS", "SHUTDOWN", "SET_MODE", "SSID", "PASSWD", "FACTORY"};
+  enum SetModeStateName {IDLE, SET_LOCAL_FOB, SET_REMOTE_FOB, SET_BATT_MON};  // SSID choice state names
+  String stateNamesArray[4] = {"IDLE", "SET_LOCAL_FOB", "SET_REMOTE_FOB", "SET_BATT_MON"};  // Device mode
 
-  FobSuperSm()
+  SetModeSm()
+  {
+    currentState = IDLE;
+    nextState = IDLE;
+  }
+
+  // display mode selection prompts
+  bool tick()
+  {
+    M5.Lcd.fillScreen(BLACK);
+    M5.Lcd.setCursor(0, 0, 2);
+
+    currentState = nextState;
+    switch(currentState)
+    {
+      case IDLE:
+        M5.Lcd.println("Current mode:");
+        M5.Lcd.println(DeviceModeText[configuredMode]);
+        M5.Lcd.println("M5: CHANGE\nB: Next; PWR: Prev");
+        break;
+      case SET_LOCAL_FOB:
+        M5.Lcd.println("M5: set mode:");
+        M5.Lcd.println(DeviceModeText[LOCAL_FOB_MODE]);
+        M5.Lcd.println("B: Next; PWR: Prev");
+        break;
+      case SET_REMOTE_FOB:
+        M5.Lcd.println("M5: set mode:");
+        M5.Lcd.println(DeviceModeText[REMOTE_FOB_MODE]);
+        M5.Lcd.println("B: Next; PWR: Prev");
+        break;
+      case SET_BATT_MON:
+        // for some unknown reason, printf(DeviceModeText[BATT....]) printed corrupt data but println is ok
+        M5.Lcd.println("M5: set mode:");
+        M5.Lcd.println(DeviceModeText[BATTERY_MON_MODE]);
+        M5.Lcd.println("B: Next; PWR: Prev");
+        break;
+      default:
+        currentState = IDLE;
+        nextState = IDLE;
+    }
+    return false;
+  }
+
+  //! @return true: advance super SM, false: no state change
+  // no return from Select
+  bool buttonPress(ButtonCommand buttonCommand)
+  {
+    switch(currentState)
+    {
+      case IDLE:
+        if (SELECT == buttonCommand)
+        {
+          nextState = SET_LOCAL_FOB;
+
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.println("CHANGE MODE");
+          delay(2000);
+          return false;
+        }
+        else
+          return true;  // NEXT or PREV change major states
+        break;
+      case SET_LOCAL_FOB:
+        if (SELECT == buttonCommand)
+        {
+          Serial.println("SET LOCAL FOB mode");
+          eepromConfig.configuredMode = LOCAL_FOB_MODE;
+          writeEepromConfig(); // Does not return
+        }
+        else if (NEXT == buttonCommand)
+          nextState = SET_REMOTE_FOB;
+        else
+          nextState = IDLE;  // PREVIOUS
+        break;
+      case SET_REMOTE_FOB:
+        if (SELECT == buttonCommand)
+        {
+          Serial.println("SET REMOTE FOB mode");
+          eepromConfig.configuredMode = REMOTE_FOB_MODE;
+          writeEepromConfig(); // Does not return
+        }
+        else if (NEXT == buttonCommand)
+        {
+          nextState = SET_BATT_MON;
+        }
+        else
+          nextState = SET_LOCAL_FOB;  // PREVIOUS
+        break;
+      case SET_BATT_MON:
+        if (SELECT == buttonCommand)
+        {
+          Serial.println("SET BATT MON mode");
+          eepromConfig.configuredMode = BATTERY_MON_MODE;
+          writeEepromConfig(); // Does not return
+        }
+        else if (NEXT == buttonCommand)
+          nextState = IDLE;
+        else
+          nextState = SET_REMOTE_FOB;  // PREVIOUS
+        break;
+    }
+    return false;
+  }
+
+private:
+  SetModeStateName currentState;
+  SetModeStateName nextState;
+};
+
+class SetDateTimeSm
+{
+public:
+  enum SetDateTimeStateName {IDLE, SET_YEAR, SET_MONTH, SET_DAY, SET_HOUR, SET_MINUTE};  // Date/Time state names
+  String stateNamesArray[6] = {"IDLE", "SET_YEAR", "SET_MONTH", "SET_DAY", "SET_HOUR", "SET_MINUTE"};
+
+  SetDateTimeSm()
+  {
+    currentState = IDLE;
+    nextState = IDLE;
+  }
+
+  // display mode selection prompts
+  bool tick()
+  {
+    M5.Lcd.fillScreen(BLACK);
+
+    M5.Rtc.getTime(&RTC_TimeStruct);
+    M5.Rtc.getDate(&RTC_DateStruct);
+
+    M5.Lcd.setCursor(0, 1, 1);
+    M5.Lcd.printf("%04d-%02d-%02d\n", RTC_DateStruct.year,
+      RTC_DateStruct.month, RTC_DateStruct.date);
+    M5.Lcd.printf("%02d:%02d:%02d\n", RTC_TimeStruct.hours,
+      RTC_TimeStruct.minutes, RTC_TimeStruct.seconds);
+
+    M5.Lcd.setCursor(0, 35);    // place cursor for prompt
+    currentState = nextState;
+    switch(currentState)
+    {
+      case IDLE:
+        M5.Lcd.println("M5: CHANGE DATE/TIME\nB: Next, PWR: Prev");
+        break;
+      case SET_YEAR:
+        M5.Lcd.println("M5: Accept YEAR\nB: Next YEAR\nPWR: Prev YEAR");
+        break;
+      case SET_MONTH:
+        M5.Lcd.println("M5: Accept MONTH\nB: Next MONTH\nPWR: Prev MONTH");
+        break;
+      case SET_DAY:
+        M5.Lcd.println("M5: Accept DAY-OF-MO\nB: Next DAY-OF-MO\nPWR: Prev DAY-OF-MO");
+        break;
+      case SET_HOUR:
+        M5.Lcd.println("M5: Accept HOUR\nB: Next HOUR\nPWR: Prev HOUR");
+        break;
+      case SET_MINUTE:
+        M5.Lcd.println("M5: Accept MINUTE\nB: Next MINUTE\nPWR: Prev MINUTE");
+        break;
+      default:
+        currentState = IDLE;
+        nextState = IDLE;
+    }
+    return false;
+  }
+
+  //! @return true: advance super SM, false: no state change
+  bool buttonPress(ButtonCommand buttonCommand)
+  {
+    Serial.printf("SetDateTimeSm in state %s got button %d\n", stateNamesArray[currentState], buttonCommand);
+    switch(currentState)
+    {
+      case IDLE:
+        if (SELECT == buttonCommand)
+          nextState = SET_YEAR;
+        else
+          return true;  // advance superSm
+        break;
+      case SET_YEAR:
+        if (SELECT == buttonCommand)
+          nextState = SET_MONTH;
+        else if (NEXT == buttonCommand)
+          RTC_DateStruct.year++;
+        else if (PREVIOUS == buttonCommand)
+          RTC_DateStruct.year--;
+        
+        if (RTC_DateStruct.year > 2030)
+          RTC_DateStruct.year = 2030;
+        if (RTC_DateStruct.year < 2024)
+          RTC_DateStruct.year = 2024;
+        M5.Rtc.setDate(&RTC_DateStruct);
+        break;
+      case SET_MONTH:
+        if (SELECT == buttonCommand)
+          nextState = SET_DAY;
+        else if (NEXT == buttonCommand)
+          RTC_DateStruct.month++;
+        else if (PREVIOUS == buttonCommand)
+          RTC_DateStruct.month--;
+        
+        if (RTC_DateStruct.month > 12)
+          RTC_DateStruct.month = 1;
+        if (RTC_DateStruct.month < 1)
+          RTC_DateStruct.month = 12;
+        M5.Rtc.setDate(&RTC_DateStruct);
+        break;
+      case SET_DAY:
+        if (SELECT == buttonCommand)
+          nextState = SET_HOUR;
+        else if (NEXT == buttonCommand)
+          RTC_DateStruct.date++;
+        else if (PREVIOUS == buttonCommand)
+          RTC_DateStruct.date--;
+        
+        if (RTC_DateStruct.date > 31)
+          RTC_DateStruct.date = 1;
+        if (RTC_DateStruct.date < 1)
+          RTC_DateStruct.date = 31;
+        M5.Rtc.setDate(&RTC_DateStruct);
+        break;
+      case SET_HOUR:
+        if (SELECT == buttonCommand)
+          nextState = SET_MINUTE;
+        else if (NEXT == buttonCommand)
+          RTC_TimeStruct.hours++;
+        else if (PREVIOUS == buttonCommand)
+          RTC_TimeStruct.hours--;
+        
+        if (RTC_TimeStruct.hours > 23)
+          RTC_TimeStruct.hours = 0;
+        if (RTC_TimeStruct.hours < 0)
+          RTC_TimeStruct.hours = 23;
+        M5.Rtc.setTime(&RTC_TimeStruct);
+        break;
+      case SET_MINUTE:
+        if (SELECT == buttonCommand)
+          nextState = IDLE;
+        else if (NEXT == buttonCommand)
+          RTC_TimeStruct.minutes++;
+        else if (PREVIOUS == buttonCommand)
+          RTC_TimeStruct.minutes--;
+        
+        if (RTC_TimeStruct.minutes > 59)
+          RTC_TimeStruct.minutes = 0;
+        if (RTC_TimeStruct.minutes < 0)
+          RTC_TimeStruct.minutes = 59;
+        M5.Rtc.setTime(&RTC_TimeStruct);
+        break;
+      default:
+        nextState = IDLE;
+    }
+    return false;
+  }
+
+private:
+  SetDateTimeStateName currentState;
+  SetDateTimeStateName nextState;
+};
+
+class SuperSm
+{
+public:
+  enum SuperStateName {WIFI_INIT, FOB_STATUS, BATT_MON_STATUS, SHUTDOWN, SET_MODE, SSID, PASSWD, MIDNIGHT_OFF, DATE_TIME, FACTORY}; // Superstate state names
+  String stateNamesArray[10] = {"WIFI_INIT", "FOB_STATUS", "BATT_MON_STATUS", "SHUTDOWN", "SET_MODE", "SSID", "PASSWD", "MIDNIGHT_OFF", "DATE_TIME", "FACTORY"};
+
+  SuperSm()
   {
     currentState = WIFI_INIT;
     nextState = WIFI_INIT;
@@ -937,6 +1191,7 @@ public:
   void tick()
   {
     bool rv;
+    String soc;
 
     currentState = nextState;
     switch (currentState)
@@ -945,8 +1200,12 @@ public:
         rv = wifiInitSm.tick();
         if (rv)
         {
-          nextState = FOB_STATUS;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          // Done with wifi init, move to status state for FOB or Battery Monitor
+          if (BATTERY_MON_MODE == configuredMode)
+            nextState = BATT_MON_STATUS;
+          else
+            nextState = FOB_STATUS;
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case FOB_STATUS:
@@ -966,8 +1225,51 @@ public:
         if (rv)
         {
           nextState = SHUTDOWN;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
+        break;
+      case BATT_MON_STATUS:
+        // Get the time-of-day from the real-time clock for use by various called functions.
+        M5.Rtc.getTime(&RTC_TimeStruct);
+        M5.Rtc.getDate(&RTC_DateStruct);
+
+        midnightCheck();  // is it midnight?
+
+        // read battery voltage and react if low
+        batteryVolts = readVolts();
+
+        if (batteryVolts < shutdownVLimit)
+        {
+          // power off when master switch turned off
+          const int cancelDelaySec = 5;
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.println("Shutting\nDown");
+          delay(2000);
+
+          M5.Power.powerOff();
+          // never reached
+        }
+        else if (batteryVolts < lowVLimit)
+        {
+          // shut down linky when battery gets low
+          setPowerEnable(false);
+        }
+
+        // compute battery status msg
+        if (batteryVolts >= 13.5) soc = "100%";
+        else if (batteryVolts >=13.4) soc = "99%";
+        else if (batteryVolts >=13.3) soc = "90-99%";
+        else if (batteryVolts >=13.2) soc = "70-90%";
+        else if (batteryVolts >=13.1) soc = "40-70%";
+        else if (batteryVolts >=13.0) soc = "30-40%";
+        else if (batteryVolts >=12.9) soc = "20-30%";
+        else if (batteryVolts >=12.8) soc = "10-20%";
+        else if (batteryVolts >=10.8) soc = "1-10%";
+        else soc = "Unknown";
+
+        sprintf(statusMsg, "%s, %0.2fV\nSoC %s\0", powerEnableStatus?"ON":"OFF", batteryVolts, soc.c_str());
+        displayStatus();
         break;
       case SHUTDOWN:
         shutdownSm.tick();  // run the cancel timer
@@ -981,10 +1283,21 @@ public:
       case PASSWD:
         passwdSm.tick();
         break;
+      case MIDNIGHT_OFF:
+        M5.Lcd.fillScreen(BLACK);
+        M5.Lcd.setCursor(0, 0, 2);
+        M5.Lcd.print("Midnight: ");
+        M5.Lcd.println(midnightOff?"Turn OFF":"Stay ON");
+        M5.Lcd.println("M5: Change");
+        M5.Lcd.println("B: next; PWR: prev");
+        break;
+      case DATE_TIME:
+        setDateTimeSm.tick();
+        break;
       case FACTORY:
         M5.Lcd.fillScreen(BLACK);
         M5.Lcd.setCursor(0, 0, 2);
-        M5.Lcd.println("M5: FACTORY RESET");
+        M5.Lcd.println("M5: FACTORY\nRESET");
         M5.Lcd.println("B: next; PWR: prev");
         break;
       default:
@@ -995,7 +1308,7 @@ public:
   void buttonPress(ButtonCommand buttonCommand)
   {
     bool rv;
-    Serial.printf("FobSuperSm button press %d in state %s\n"
+    Serial.printf("SuperSm button press %d in state %s\n"
                   , buttonCommand, stateNamesArray[currentState].c_str());
     switch (currentState)
     {
@@ -1004,23 +1317,24 @@ public:
         if (rv)
         {
           nextState = FOB_STATUS;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case FOB_STATUS:
+      case BATT_MON_STATUS:
         rv = statusButton(buttonCommand);
-        Serial.printf("button push in FobSuperSm returned %d\n", rv);
+        Serial.printf("button push in SuperSm returned %d\n", rv);
         if (rv)   // change super-state
         {
           if (buttonCommand == NEXT)
           {
             nextState = SSID;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+            Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
           }
           else if (buttonCommand == PREVIOUS)
           {
             nextState = FACTORY;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+            Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
           }
         }
         break;
@@ -1029,7 +1343,7 @@ public:
         if (rv)
         {
           nextState = FOB_STATUS;
-          Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case SSID:
@@ -1037,15 +1351,15 @@ public:
         if (rv)
         {
           if (buttonCommand == NEXT)
-          {
             nextState = PASSWD;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-          }
           else if (buttonCommand == PREVIOUS)
           {
-            nextState = FOB_STATUS;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+            if (BATTERY_MON_MODE == configuredMode)
+              nextState = BATT_MON_STATUS;
+            else
+              nextState = FOB_STATUS;
           }
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case PASSWD:
@@ -1053,15 +1367,10 @@ public:
         if (rv)
         {
           if (NEXT == buttonCommand)
-          {
             nextState = SET_MODE;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-          }
           else if (PREVIOUS == buttonCommand)
-          {
             nextState = SSID;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-          }
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case SET_MODE:
@@ -1070,14 +1379,48 @@ public:
         {
           if (NEXT == buttonCommand)
           {
-            nextState = FACTORY;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+            if (BATTERY_MON_MODE == configuredMode)
+              nextState = MIDNIGHT_OFF;
+            else
+              nextState = FACTORY;
           }
           else if (PREVIOUS == buttonCommand)
-          {
             nextState = PASSWD;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
-          }
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        }
+        break;
+      case MIDNIGHT_OFF:
+        if (SELECT == buttonCommand)
+        {
+          if (midnightOff)
+            midnightOff = 0;
+          else
+            midnightOff = 1;
+          eepromConfig.midnightOff = midnightOff;
+
+          M5.Lcd.fillScreen(BLACK);
+          M5.Lcd.setCursor(0, 0, 2);
+          M5.Lcd.println("Midnight:");
+          M5.Lcd.println(midnightOff?"Turn OFF":"Stay ON");
+          delay(2000);
+
+          writeEepromConfig();  // does not return
+        }
+        else if (NEXT == buttonCommand)
+          nextState = DATE_TIME;
+        else
+          nextState = SET_MODE;
+        Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+        break;
+      case DATE_TIME:
+        rv = setDateTimeSm.buttonPress(buttonCommand);
+        if (rv)
+        {
+          if (NEXT == buttonCommand)
+            nextState = FACTORY;
+          else if (PREVIOUS == buttonCommand)
+            nextState = MIDNIGHT_OFF;
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       case FACTORY:
@@ -1086,14 +1429,19 @@ public:
         {
           if (NEXT == buttonCommand)
           {
-            nextState = FOB_STATUS;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+            if (BATTERY_MON_MODE == configuredMode)
+              nextState = BATT_MON_STATUS;
+            else
+              nextState = FOB_STATUS;
           }
           else if (PREVIOUS == buttonCommand)
           {
-            nextState = SET_MODE;
-            Serial.printf("FobSuperSm next state: %s\n", stateNamesArray[nextState].c_str());
+            if (BATTERY_MON_MODE == configuredMode)
+              nextState = DATE_TIME;
+            else
+              nextState = SET_MODE;
           }
+          Serial.printf("SuperSm next state: %s\n", stateNamesArray[nextState].c_str());
         }
         break;
       default:
@@ -1117,31 +1465,7 @@ private:
   SsidSm ssidSm = SsidSm();
   PasswdSm passwdSm = PasswdSm();
   SetModeSm setModeSm = SetModeSm();
-
-#if 0
-  bool modeButton(ButtonCommand buttonCommand)
-  {
-    Serial.printf("modeButton button press %d\n", buttonCommand);
-    if (SELECT == buttonCommand)
-    {
-      Serial.println("mode change button press");
-      M5.Lcd.fillScreen(BLACK);
-      M5.Lcd.setCursor(0, 0, 2);
-      M5.Lcd.println("MODE CHANGE");
-      delay(2000);
-      if (eepromConfig.configuredMode == LOCAL_FOB_MODE)
-      {
-        eepromConfig.configuredMode = REMOTE_FOB_MODE;
-      }
-      else
-      {
-        eepromConfig.configuredMode = LOCAL_FOB_MODE;
-      }
-      writeEepromConfig();  // does not return
-    }
-    return true;
-  }
-#endif
+  SetDateTimeSm setDateTimeSm = SetDateTimeSm();
 
   bool factoryButton(ButtonCommand buttonCommand)
   {
@@ -1174,7 +1498,7 @@ private:
 
 //! @return true: advance super SM, false: no state change
 bool
-FobSuperSm::statusButton(ButtonCommand buttonCommand)
+SuperSm::statusButton(ButtonCommand buttonCommand)
 {
   Serial.printf("statusButton button press %d\n", buttonCommand);
   if (SELECT == buttonCommand)
@@ -1183,7 +1507,10 @@ FobSuperSm::statusButton(ButtonCommand buttonCommand)
     M5.Lcd.fillScreen(BLACK);
     M5.Lcd.setCursor(0, 0, 2);
     M5.Lcd.println("TOGGLING POWER");
-    udp.writeTo((uint8_t*)"toggle", 6, linkyM5IP, udpPort);
+    if (BATTERY_MON_MODE == configuredMode)
+      setPowerEnable(!powerEnableStatus);
+    else
+      udp.writeTo((uint8_t*)"toggle", 6, linkyM5IP, udpPort);
     delay(1000);
     return false;
   }
@@ -1196,11 +1523,11 @@ FobSuperSm::statusButton(ButtonCommand buttonCommand)
   return false;   // stay in this state if not asked to move
 }
 
-FobSuperSm fobSuperSm = FobSuperSm();
+SuperSm fobSuperSm = SuperSm();
 
 void printEeprom()
 {
-  Serial.printf("0x%x %d %d %d %d\n", eepromConfig.magic, eepromConfig.version
+  Serial.printf("EEPROM: 0x%x %d %d %d %d\n", eepromConfig.magic, eepromConfig.version
   , eepromConfig.midnightOff, eepromConfig.configuredMode);
   Serial.println(eepromConfig.configuredLocalSsid);
   Serial.println(eepromConfig.localPasswd);
@@ -1219,15 +1546,12 @@ void setup() {
   sprintf(statusMsg, "starting");
 
   Serial.begin(9600);
+  delay(500);
+  Serial.println("\nStarting");
 
   // initialize time
   int64_t now = esp_timer_get_time();
   nextSecondTime = now + 1000000;  // time to increment the seconds counter
-
-  // Set WiFi to station mode and disconnect from an AP if it was previously connected.
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
 
   // Initialize EEPROM
   if (!EEPROM.begin(sizeof(EepromConfig))) {  // Request storage of SIZE size(success return)
@@ -1257,6 +1581,9 @@ void setup() {
   }
 
   configuredMode = eepromConfig.configuredMode;
+  Serial.print("Starting Mode: ");
+  Serial.println(DeviceModeText[configuredMode]);
+
   if (LOCAL_FOB_MODE == configuredMode || BATTERY_MON_MODE == configuredMode)
   {
     strncpy(configuredSSID, eepromConfig.configuredLocalSsid, maxEpromStringLen);
@@ -1267,15 +1594,44 @@ void setup() {
     strncpy(configuredSSID, eepromConfig.configuredRemoteSsid, maxEpromStringLen);
     strncpy(configuredSSIDPwd, eepromConfig.remotePasswd, maxEpromStringLen);
   }
-
   Serial.printf("configuredMode: %d SSID: %s\n", configuredMode, configuredSSID);
+
+  // initialize battery monitor mode variables & pins
+  if (BATTERY_MON_MODE == configuredMode)
+  {
+    midnightOff = eepromConfig.midnightOff;
+
+    // configure battery monitor mode pins
+    // G36 is battery voltage input, G26 is Starlink power enable output
+    gpio_pulldown_dis(GPIO_NUM_25);
+    gpio_pullup_dis(GPIO_NUM_25);
+    gpio_pulldown_dis(GPIO_NUM_36);
+    gpio_pullup_dis(GPIO_NUM_36);
+
+    pinMode(STARLINK_POWER_PIN, OUTPUT);
+    digitalWrite(STARLINK_POWER_PIN, HIGH);
+    powerEnableStatus = true;
+
+    // initialize array for battery voltage trailing average
+    for (int i=0; i<avgArraySize; i++)
+      batteryVoltsArray[i] = 13.0;  // initialize with good value that doesn't trigger shutdown
+
+    // Get the time-of-day from the real-time clock.
+    M5.Rtc.getTime(&RTC_TimeStruct);
+    M5.Rtc.getDate(&RTC_DateStruct);
+    lastHour = RTC_TimeStruct.hours;
+  }
+
+  
 }
 
-// Some operations, like scan ssids, take more than 1 second
-// so FobSuperSm is late to return and loop doesn't get to spin
+// resetNextTickTime updates when loop() will call superSm.tick()
+// to be a second from now. It is needed because
+// some operations, like scan ssids, take more than 1 second
+// so SuperSm is late to return and loop doesn't get to spin
 // and detect button pushes. If called, this method ensures a
 // period where loop() idles to allow display and buttons
-void updateNextLoopTime()
+void resetNextTickTime()
 {
   nextSecondTime = esp_timer_get_time() + 1000000;
 }
